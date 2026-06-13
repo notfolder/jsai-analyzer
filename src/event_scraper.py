@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://confit.atlas.jp"
 EVENTS_URL = f"{BASE_URL}/guide/organizer/jsai/events"
 
+# 2026年度以降の新サイト
+PUB_BASE_URL = "https://pub.confit.atlas.jp"
+PUB_MIN_YEAR = 2026  # pub.confit.atlas.jp に移行した年度
+
 # 年度別トークン（セッションURLのクエリパラメータ）
 # タイムテーブルページを読んだ際に実際のリンクに含まれるので自動取得するが
 # フォールバック用に既知の値を保持する
@@ -68,7 +72,7 @@ class EventScraper:
     # ------------------------------------------------------------------
 
     async def fetch_events(self) -> list[EventInfo]:
-        """大会一覧ページから2018年度以降の大会情報を取得"""
+        """大会一覧ページから大会情報を取得（2026年度以降は新サイトを直接追加）"""
         ok = await self._load(EVENTS_URL)
         if not ok:
             logger.error("大会一覧ページの読み込み失敗: %s", EVENTS_URL)
@@ -98,6 +102,17 @@ class EventScraper:
                 top_url=link["href"],
             ))
 
+        # 2026年度以降は pub.confit.atlas.jp を直接追加
+        for year in range(max(self._config.start_year, PUB_MIN_YEAR),
+                          self._config.end_year + 1):
+            if year not in seen_years:
+                events.append(EventInfo(
+                    year=year,
+                    name=f"{year}年度 人工知能学会全国大会",
+                    top_url=f"{PUB_BASE_URL}/ja/event/jsai{year}",
+                ))
+                seen_years.add(year)
+
         events.sort(key=lambda e: e.year)
         logger.info("大会数: %d件", len(events))
         return events
@@ -114,21 +129,30 @@ class EventScraper:
                 .map(a => ({ href: a.href, text: a.textContent.trim() }));
         }""")
 
+        is_pub = event.year >= PUB_MIN_YEAR
+        # 旧サイト: YYYYMMDD(_poster)?  新サイト: YYYY-MM-DD
+        table_re = re.compile(
+            r"/table/(\d{4}-\d{2}-\d{2})" if is_pub
+            else r"/table/(\d{8}(_poster)?)"
+        )
+
         days: list[ScheduleDay] = []
         seen: set[str] = set()
         for link in links:
-            m = re.search(r"/table/(\d{8}(_poster)?)", link["href"])
+            m = table_re.search(link["href"])
             if not m:
                 continue
             date_str = m.group(1)
             if date_str in seen:
                 continue
             seen.add(date_str)
+            # 新サイトはポスター専用ページなし（ポスターも同一日程ページ内）
+            is_poster = False if is_pub else ("_poster" in date_str)
             days.append(ScheduleDay(
                 year=event.year,
                 date_str=date_str,
                 label=link["text"],
-                is_poster="_poster" in date_str,
+                is_poster=is_poster,
                 url=link["href"],
             ))
 
@@ -143,18 +167,30 @@ class EventScraper:
             logger.error("タイムテーブルページ読み込み失敗: %s", day.url)
             return []
 
-        links = await self._page.evaluate("""() => {
-            return Array.from(document.querySelectorAll('a[href*="/session/"]'))
-                .map(a => ({ href: a.href, text: a.textContent.trim() }))
-                .filter(a => !a.href.startsWith('mailto'));
-        }""")
+        is_pub = day.year >= PUB_MIN_YEAR
+
+        if is_pub:
+            # 新サイト: /session/{raw_id} 形式（末尾スラッシュなし・トークンなし）
+            links = await self._page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('a[href*="/session/"]'))
+                    .map(a => ({ href: a.href, text: a.textContent.trim() }))
+                    .filter(a => !a.href.includes('login'));
+            }""")
+            session_re = re.compile(r"/session/([^/?#]+)$")
+        else:
+            # 旧サイト: /session/{raw_id}/tables?token 形式
+            links = await self._page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('a[href*="/session/"]'))
+                    .map(a => ({ href: a.href, text: a.textContent.trim() }))
+                    .filter(a => !a.href.startsWith('mailto'));
+            }""")
+            session_re = re.compile(r"/session/([^/]+)/")
 
         sessions: list[SessionInfo] = []
         seen: set[str] = set()
         for link in links:
             href = link["href"]
-            # /session/{raw_id}/tables からraw_idを抽出
-            m = re.search(r"/session/([^/]+)/", href)
+            m = session_re.search(href)
             if not m:
                 continue
             raw_id = m.group(1)
@@ -182,13 +218,17 @@ class EventScraper:
             logger.error("セッションページ読み込み失敗: %s", session.url)
             return []
 
-        links = await self._page.evaluate("""() => {
-            return Array.from(document.querySelectorAll('a[href*="/subject/"]'))
-                .map(a => a.href)
-                .filter(h => !h.startsWith('mailto'));
-        }""")
+        is_pub = session.year >= PUB_MIN_YEAR
+        # 新サイトは /presentation/{id}、旧サイトは /subject/{id}
+        link_selector = 'a[href*="/presentation/"]' if is_pub else 'a[href*="/subject/"]'
 
-        # 重複除去（"PDF ダウンロード" リンクなど同一URLが複数出る）
+        links = await self._page.evaluate(f"""() => {{
+            return Array.from(document.querySelectorAll('{link_selector}'))
+                .map(a => a.href)
+                .filter(h => !h.includes('login') && !h.startsWith('mailto'));
+        }}""")
+
+        # 重複除去（PDFダウンロードリンクなど同一URLが複数出る場合）
         seen: set[str] = set()
         unique_urls: list[str] = []
         for url in links:
@@ -214,25 +254,70 @@ class EventScraper:
             logger.warning("発表ページ読み込み失敗: %s", url)
             return None
 
-        data = await self._page.evaluate("""() => {
-            // タイトル (article内の h1[title="講演名"])
-            const titleEl = document.querySelector('article h1[title="講演名"], article .title h1');
-            const titleRaw = titleEl ? titleEl.textContent.trim() : '';
+        is_pub = year >= PUB_MIN_YEAR
 
-            // キーワード
-            const kwEl = document.querySelector('article .keyword, article p[title="キーワード"]');
-            const kwRaw = kwEl ? kwEl.textContent.trim() : '';
+        if is_pub:
+            # 新サイト (pub.confit.atlas.jp) 用セレクタ
+            # タイトル: main h1.thd 内に [ID]スパン + タイトルテキスト + サブタイトルスパン
+            # キーワード: h2.tcapt の次の p.tsm
+            # 要約: .pd-v-md 直下の .mg-t-md
+            data = await self._page.evaluate("""() => {
+                // タイトルh1
+                const h1 = document.querySelector('main h1.thd, .bf-content h1');
+                const idSpan = h1 ? h1.querySelector('span.tbd') : null;
+                const subSpan = h1 ? h1.querySelector('span.tdf, span.d-blk.tdf') : null;
 
-            // 要約 (.summary または .outline)
-            const abEl = document.querySelector('article .summary, article .outline');
-            const abstract = abEl ? abEl.textContent.trim() : '';
+                let titleRaw = '';
+                let subtitle = '';
+                if (h1) {
+                    // サブタイトルを先に退避してから残りをタイトルとする
+                    const clone = h1.cloneNode(true);
+                    const subClone = clone.querySelector('span.tdf, span.d-blk.tdf');
+                    if (subClone) {
+                        subtitle = subClone.textContent.trim();
+                        subClone.remove();
+                    }
+                    const idClone = clone.querySelector('span.tbd');
+                    const idText = idClone ? idClone.textContent.trim() : '';
+                    if (idClone) idClone.remove();
+                    const rawTitle = clone.textContent.trim();
+                    titleRaw = idText ? idText + ' ' + rawTitle : rawTitle;
+                }
 
-            // サブタイトル（subtitle クラスが存在する年度向け）
-            const subEl = document.querySelector('article .subtitle, article h2.subtitle');
-            const subtitle = subEl ? subEl.textContent.trim() : '';
+                // キーワード: h2.tcapt の次のp要素
+                const kwHeader = document.querySelector('h2.tcapt');
+                const kwEl = kwHeader ? kwHeader.nextElementSibling : null;
+                const kwRaw = kwEl ? kwEl.textContent.trim() : '';
 
-            return { titleRaw, kwRaw, abstract, subtitle };
-        }""")
+                // 要約: .pd-v-md 直下の最初の .mg-t-md
+                const absEl = document.querySelector('.pd-v-md .mg-t-md, .pd-v-md > div:not(.l-flex):not([class*="pd"]):not([class*="mg-t-base"]):not([class*="bdb"])  > .mg-t-md');
+                // フォールバック: h2.tcaptの後ろのdiv
+                const absEl2 = document.querySelector('.box-s-bkg + .mg-t-md, .box-s-bkg ~ .mg-t-md');
+                const abstract = (absEl || absEl2) ? (absEl || absEl2).textContent.trim() : '';
+
+                return { titleRaw, kwRaw, abstract, subtitle };
+            }""")
+        else:
+            # 旧サイト (confit.atlas.jp) 用セレクタ
+            data = await self._page.evaluate("""() => {
+                // タイトル (article内の h1[title="講演名"])
+                const titleEl = document.querySelector('article h1[title="講演名"], article .title h1');
+                const titleRaw = titleEl ? titleEl.textContent.trim() : '';
+
+                // キーワード
+                const kwEl = document.querySelector('article .keyword, article p[title="キーワード"]');
+                const kwRaw = kwEl ? kwEl.textContent.trim() : '';
+
+                // 要約 (.summary または .outline)
+                const abEl = document.querySelector('article .summary, article .outline');
+                const abstract = abEl ? abEl.textContent.trim() : '';
+
+                // サブタイトル（subtitle クラスが存在する年度向け）
+                const subEl = document.querySelector('article .subtitle, article h2.subtitle');
+                const subtitle = subEl ? subEl.textContent.trim() : '';
+
+                return { titleRaw, kwRaw, abstract, subtitle };
+            }""")
 
         title_raw: str = data.get("titleRaw", "").strip()
         kw_raw: str = data.get("kwRaw", "").strip()
@@ -246,7 +331,10 @@ class EventScraper:
             title = m.group(2).strip()
         else:
             # フォールバック: URLからIDを取得
-            um = re.search(r"/subject/([^/]+)/", url)
+            if year >= PUB_MIN_YEAR:
+                um = re.search(r"/presentation/([^/?#]+)", url)
+            else:
+                um = re.search(r"/subject/([^/]+)/", url)
             presentation_id = um.group(1) if um else ""
             title = title_raw
 
@@ -254,13 +342,21 @@ class EventScraper:
         keywords = re.sub(r"^キーワード[：:]\s*", "", kw_raw).strip()
 
         # URLに含まれる発表IDからセッションIDを補完
-        um = re.search(r"/subject/([^/]+)/", url)
-        if um:
-            subject_raw = um.group(1)
-            # 末尾の "-数字" を除いた部分がセッションID
-            derived_session_id = re.sub(r"-\d+$", "", subject_raw)
-            if not session_id or session_id == subject_raw:
+        if year >= PUB_MIN_YEAR:
+            um = re.search(r"/presentation/([^/?#]+)", url)
+            if um:
+                subject_raw = um.group(1)
+                derived_session_id = re.sub(r"-\d+$", "", subject_raw)
+                # 2026新サイトはraw_idがハッシュなので常に発表URLベースのIDを使用
                 session_id = derived_session_id
+        else:
+            um = re.search(r"/subject/([^/]+)/", url)
+            if um:
+                subject_raw = um.group(1)
+                # 末尾の "-数字" を除いた部分がセッションID
+                derived_session_id = re.sub(r"-\d+$", "", subject_raw)
+                if not session_id or session_id == subject_raw:
+                    session_id = derived_session_id
 
         return PresentationInfo(
             year=year,
