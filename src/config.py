@@ -14,4 +14,4 @@ class CrawlerConfig:
     headless: bool = True
     output_dir: str = "output"
     start_year: int = 2018
-    end_year: int = 2025
+    end_year: int = 2026
