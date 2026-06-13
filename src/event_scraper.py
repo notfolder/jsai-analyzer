@@ -119,6 +119,13 @@ class EventScraper:
 
     async def fetch_schedule_days(self, event: EventInfo) -> list[ScheduleDay]:
         """大会トップページから全日程URLを取得"""
+        is_pub = event.year >= PUB_MIN_YEAR
+        if is_pub:
+            # pub.confit.atlas.jp はJSAI公式サイトを先に踏まないと403になる
+            prefetch_url = f"https://conf.ai-gakkai.or.jp/jsai{event.year}/"
+            logger.info("[%d] pub用プリフェッチ: %s", event.year, prefetch_url)
+            await self._load(prefetch_url)
+
         ok = await self._load(event.top_url)
         if not ok:
             logger.error("大会トップページ読み込み失敗: %s", event.top_url)

@@ -83,47 +83,22 @@ async def run(config: CrawlerConfig, resume: bool) -> None:
 
                         # Step 4: 各セッションの発表を取得
                         await asyncio.sleep(scraper._config.min_delay_sec)
+                        presentations = await scraper.fetch_presentations(session)
 
-                        # セッションページを読み込んで発表URLを収集
-                        ok = await scraper._load(session.url)
-                        if not ok:
-                            logger.warning("セッションページ失敗: %s", session.url)
-                            continue
-
-                        links = await scraper._page.evaluate("""() => {
-                            return Array.from(document.querySelectorAll('a[href*="/subject/"]'))
-                                .map(a => a.href)
-                                .filter(h => !h.startsWith('mailto'));
-                        }""")
-
-                        # 重複除去
-                        seen_urls: set[str] = set()
-                        unique_urls: list[str] = []
-                        for url in links:
-                            if url not in seen_urls:
-                                seen_urls.add(url)
-                                unique_urls.append(url)
-
-                        # Step 5: 各発表を取得
-                        for pres_url in unique_urls:
+                        # Step 5: 各発表を書き出す
+                        for pres in presentations:
+                            pres_url = pres.url
                             if progress.is_visited(pres_url):
                                 logger.debug("      スキップ（訪問済み）: %s", pres_url)
                                 continue
 
-                            await scraper._random_delay()
-                            pres = await scraper.fetch_presentation_detail(
-                                pres_url, event.year, session.session_id
+                            exporter.write(pres)
+                            total_saved += 1
+                            logger.info(
+                                "      [%s] %s",
+                                pres.presentation_id,
+                                pres.title[:50],
                             )
-
-                            if pres:
-                                exporter.write(pres)
-                                total_saved += 1
-                                logger.info(
-                                    "      [%s] %s",
-                                    pres.presentation_id,
-                                    pres.title[:50],
-                                )
-
                             progress.mark_visited(pres_url)
 
                         # セッションごとに進捗を保存
