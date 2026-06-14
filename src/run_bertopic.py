@@ -81,12 +81,28 @@ else:
     device = "cpu"
     print("デバイス: CPU")
 
+# ─── 研究発表のセッション種別フィルタ ────────────────────────────
+# 対象: 一般講演(OS)・一般セッション(GS)・ポスター(poster/WS)
+# 除外: 企業展示(IND/LS/ST)・プレナリー(PS)・企画セッション(KS)・チュートリアル(TS)・
+#       ランチョン・周年記念・isAI等のイベント系
+RESEARCH_SESSION_PATTERNS = (
+    "-OS-",      # 一般講演 (Oral Session)
+    "-GS-",      # 一般セッション / 国際セッション
+    "-WS-",      # ワークショップ
+)
+# session_id が上記パターンいずれかを含む OR session_id が「poster」を含む
+
 # ─── DB から発表データを取得 ──────────────────────────────────
 con  = sqlite3.connect(DB_PATH)
-rows = con.execute(
-    "SELECT id, pres_id, year, title, abstract FROM presentations ORDER BY id"
+all_rows = con.execute(
+    "SELECT id, pres_id, year, title, abstract, session_id FROM presentations ORDER BY id"
 ).fetchall()
-print(f"\n発表データ取得: {len(rows):,}件")
+print(f"\n発表データ取得（全件）: {len(all_rows):,}件")
+
+def is_research(session_id: str) -> bool:
+    """研究発表セッションか判定"""
+    sid = (session_id or "").upper()
+    return any(pat in sid for pat in RESEARCH_SESSION_PATTERNS)
 
 # タイトル + 要約を結合（要約が空の場合はタイトルのみ）
 def make_text(title, abstract):
@@ -94,10 +110,23 @@ def make_text(title, abstract):
     a = (abstract or "").strip()
     return f"{t} {a}".strip() if a else t
 
+# 全件テキスト（embeddingsキャッシュと対応させるため全件を保持）
+all_texts = [make_text(r[3], r[4]) for r in all_rows]
+
+# 研究発表のみに絞り込み
+rows     = [r for r in all_rows if is_research(r[5])]
+n_all    = len(all_rows)
+n_filter = len(rows)
+print(f"研究発表フィルタ後:     {n_filter:,}件 （除外: {n_all - n_filter:,}件）")
+print(f"除外内訳 — IND/PS/KS/TS/LS等: {n_all - n_filter:,}件")
+
 texts      = [make_text(r[3], r[4]) for r in rows]
 pres_ids   = [r[1] for r in rows]
 years      = [r[2] for r in rows]
 db_ids     = [r[0] for r in rows]
+# embeddings全件キャッシュ中でのインデックス
+all_ids_set = {r[0]: i for i, r in enumerate(all_rows)}
+filter_indices = [all_ids_set[r[0]] for r in rows]
 
 # ─── BERTopic モデルを構築 ────────────────────────────────────
 print("\nモデルを初期化中...")
@@ -111,20 +140,36 @@ embedding_model = SentenceTransformer(
 EMBEDDINGS_CACHE.parent.mkdir(parents=True, exist_ok=True)
 if EMBEDDINGS_CACHE.exists():
     print(f"\n[1/4] 埋め込みキャッシュを読み込み: {EMBEDDINGS_CACHE}")
-    embeddings = np.load(str(EMBEDDINGS_CACHE))
-    print(f"      shape={embeddings.shape}")
+    all_embeddings = np.load(str(EMBEDDINGS_CACHE))
+    print(f"      全件 shape={all_embeddings.shape}")
+    # キャッシュが全件分か確認（2026年追加後などで件数が増えた場合は再計算）
+    if all_embeddings.shape[0] != len(all_rows):
+        print(f"      [!] キャッシュ件数({all_embeddings.shape[0]})とDB件数({len(all_rows)})が不一致 → 再計算")
+        t1 = time.time()
+        all_embeddings = embedding_model.encode(
+            all_texts,
+            batch_size=64,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
+        np.save(str(EMBEDDINGS_CACHE), all_embeddings)
+        print(f"      完了: {time.time()-t1:.1f}秒")
 else:
     print("\n[1/4] テキストのベクトル化中（初回・キャッシュなし）...")
     t1 = time.time()
-    embeddings = embedding_model.encode(
-        texts,
+    all_embeddings = embedding_model.encode(
+        all_texts,
         batch_size=64,
         show_progress_bar=True,
         convert_to_numpy=True,
     )
-    np.save(str(EMBEDDINGS_CACHE), embeddings)
-    print(f"      完了: {time.time()-t1:.1f}秒  shape={embeddings.shape}")
+    np.save(str(EMBEDDINGS_CACHE), all_embeddings)
+    print(f"      完了: {time.time()-t1:.1f}秒  shape={all_embeddings.shape}")
     print(f"      キャッシュ保存: {EMBEDDINGS_CACHE}")
+
+# フィルタ後のembeddingsを抽出
+embeddings = all_embeddings[filter_indices]
+print(f"      フィルタ後 embeddings shape={embeddings.shape}")
 
 umap_model = UMAP(
     n_neighbors=15,
@@ -168,6 +213,7 @@ con.execute("UPDATE presentations SET topic_id=NULL, topic_label=NULL")
 con.commit()
 
 t2 = time.time()
+print(f"\nBERTopic 対象: {len(texts):,}件 (研究発表のみ)")
 topics, _ = topic_model.fit_transform(texts, embeddings=embeddings)
 elapsed = time.time() - t2
 print(f"\n[2-4] UMAP + HDBSCAN + c-TF-IDF 完了: {elapsed:.1f}秒")
@@ -193,7 +239,15 @@ topic_labels = {
     for _, row in topic_info.iterrows()
 }
 
-# presentations テーブルを更新
+# presentations テーブルを更新（研究発表のみtopic付与、除外分はNULL/−1のまま）
+# まず除外対象に -1（外れ値扱い）を設定
+non_research_ids = [r[0] for r in all_rows if not is_research(r[5])]
+if non_research_ids:
+    con.executemany(
+        "UPDATE presentations SET topic_id=-1, topic_label='[excluded]' WHERE id=?",
+        [(i,) for i in non_research_ids],
+    )
+
 update_pres = [
     (topics[i], topic_labels.get(topics[i], ""), db_ids[i])
     for i in range(len(rows))
