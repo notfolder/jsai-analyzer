@@ -55,8 +55,9 @@ FIELDNAMES = ["大会年度", "セッションID", "発表ID", "発表タイト�
 SCRIPT_DIR = Path(__file__).parent
 OUTPUT_DIR = SCRIPT_DIR / "output"
 PROGRESS_PATH = OUTPUT_DIR / "progress.json"           # 既存クローラーの進捗（読み取り専用）
-MISSING_PROGRESS_PATH = OUTPUT_DIR / "missing_progress.json"  # このスクリプト専用進捗
-SESSION_CACHE_PATH = OUTPUT_DIR / "missing_session_urls.json" # セッションURLキャッシュ
+MISSING_PROGRESS_PATH = OUTPUT_DIR / "missing_progress.json"        # このスクリプト専用進捗
+SESSION_CACHE_PATH    = OUTPUT_DIR / "missing_session_urls.json"    # セッションURLキャッシュ
+PRES_URL_CACHE_PATH   = OUTPUT_DIR / "missing_presentation_urls.json" # 発表URLキャッシュ
 OUTPUT_CSV = OUTPUT_DIR / "jsai_2026_missing.csv"      # 固定出力先（追記）
 
 # ─── ロガー設定 ────────────────────────────────────────────────────────────────
@@ -133,6 +134,31 @@ def save_session_cache(session_urls: list[str]) -> None:
     logger.info("セッションURLキャッシュ保存: %d件 → %s", len(session_urls), SESSION_CACHE_PATH)
 
 
+def load_pres_url_cache() -> list[str] | None:
+    """発表URLキャッシュを読み込む（なければNone）"""
+    if not PRES_URL_CACHE_PATH.exists():
+        return None
+    try:
+        data = json.loads(PRES_URL_CACHE_PATH.read_text(encoding="utf-8"))
+        urls = data.get("presentation_urls", [])
+        logger.info("発表URLキャッシュ読み込み: %d件 (%s)", len(urls), PRES_URL_CACHE_PATH)
+        return urls
+    except Exception:
+        return None
+
+
+def save_pres_url_cache(pres_urls: list[str]) -> None:
+    """発表URLをキャッシュに保存"""
+    from datetime import timezone
+    PRES_URL_CACHE_PATH.write_text(
+        json.dumps({"presentation_urls": pres_urls,
+                    "saved_at": datetime.now(timezone.utc).isoformat()},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info("発表URLキャッシュ保存: %d件 → %s", len(pres_urls), PRES_URL_CACHE_PATH)
+
+
 # ─── ページ読み込みヘルパー ────────────────────────────────────────────────────
 
 
@@ -178,19 +204,40 @@ async def get_program_category_urls(page) -> list[dict]:
 
 
 async def get_session_urls_from_category(page, category_url: str, category_name: str) -> list[str]:
-    """カテゴリページから全セッションURLを取得"""
+    """カテゴリページから全セッションURLを取得（ページネーション対応）"""
     ok = await load_page(page, category_url)
     if not ok:
         logger.warning("カテゴリページ読み込み失敗: %s", category_url)
         return []
 
-    links = await page.evaluate("""() => {
-        return Array.from(document.querySelectorAll('a[href*="/session/"]'))
-            .map(a => a.href)
-            .filter(h => !h.includes('login'));
-    }""")
-    unique = list(dict.fromkeys(links))  # 順序保持しつつ重複除去
-    logger.info("  [%s] セッション数: %d", category_name, len(unique))
+    all_links: list[str] = []
+    page_num = 1
+
+    while True:
+        links = await page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('a[href*="/session/"]'))
+                .map(a => a.href)
+                .filter(h => !h.includes('login'));
+        }""")
+        all_links.extend(links)
+        logger.debug("  [%s] ページ%d: %d件", category_name, page_num, len(links))
+
+        # 「次へ」ボタンが有効か確認（disabledでないこと）
+        has_next = await page.evaluate("""() => {
+            const btn = document.querySelector('.pager-btn-next');
+            return btn && !btn.disabled && !btn.classList.contains('disabled');
+        }""")
+        if not has_next or page_num >= 20:
+            break
+
+        # 「次へ」クリック
+        await page.click('.pager-btn-next')
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+        await asyncio.sleep(1.0)
+        page_num += 1
+
+    unique = list(dict.fromkeys(all_links))  # 順序保持しつつ重複除去
+    logger.info("  [%s] セッション総数: %d（%dページ）", category_name, len(unique), page_num)
     return unique
 
 
@@ -289,7 +336,7 @@ async def run(dry_run: bool = False, reset: bool = False) -> None:
 
     # --reset: キャッシュを削除して最初からやり直し
     if reset:
-        for p in [MISSING_PROGRESS_PATH, SESSION_CACHE_PATH]:
+        for p in [MISSING_PROGRESS_PATH, SESSION_CACHE_PATH, PRES_URL_CACHE_PATH]:
             if p.exists():
                 p.unlink()
                 logger.info("削除: %s", p)
@@ -335,15 +382,20 @@ async def run(dry_run: bool = False, reset: bool = False) -> None:
         else:
             categories = [{"text": "(キャッシュ)", "href": ""}]  # dry-run 表示用
 
-        # ─── Step 3: 全発表URLを収集 ─────────────────────────────────────
-        all_pres_urls: list[str] = []
-        for i, sess_url in enumerate(unique_session_urls, 1):
-            logger.info("セッション [%d/%d]: %s", i, len(unique_session_urls), sess_url)
-            await random_delay()
-            pres_urls = await get_presentation_urls_from_session(page, sess_url)
-            all_pres_urls.extend(pres_urls)
+        # ─── Step 3: 全発表URLを収集（キャッシュがあればスキップ） ──────
+        unique_pres_urls = load_pres_url_cache()
+        if unique_pres_urls is None:
+            all_pres_urls: list[str] = []
+            for i, sess_url in enumerate(unique_session_urls, 1):
+                logger.info("セッション [%d/%d]: %s", i, len(unique_session_urls), sess_url)
+                await random_delay()
+                pres_urls = await get_presentation_urls_from_session(page, sess_url)
+                all_pres_urls.extend(pres_urls)
 
-        unique_pres_urls = list(dict.fromkeys(all_pres_urls))
+            unique_pres_urls = list(dict.fromkeys(all_pres_urls))
+            save_pres_url_cache(unique_pres_urls)
+        else:
+            logger.info("発表URLキャッシュを使用（セッションページのロードをスキップ）")
         new_pres_urls = [u for u in unique_pres_urls if u not in visited]
 
         logger.info("発表URL合計: %d  |  未取得（新規）: %d  |  スキップ: %d",
